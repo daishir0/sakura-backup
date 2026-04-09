@@ -9,6 +9,8 @@
 - **完全なメタデータ保持**: tar でタイムスタンプ・権限・所有者情報を保存
 - **SHA1整合性検証**: リモートファイルのハッシュ検証（PHP経由、FreeBSD対応）
 - **対話型UI**: バックアップ・リストア・一覧・検証をメニュー操作
+- **CLIモード**: `backup` サブコマンドで非対話実行（cron / systemd timer 向け）
+- **任意ファイル名**: CLIでは `--name` で固定ファイル名指定、台帳は同名エントリを自動更新（1ファイル1エントリ維持）
 
 ## セットアップ
 
@@ -192,10 +194,127 @@ python3 sakura_backup.py
   全てのバックアップファイルが正常です。
 ```
 
+## CLIモード（非対話）
+
+cron や systemd timer からの自動実行向け。引数ありで起動するとCLIモードになり、引数なしだと従来の対話メニューが起動します。
+
+### `backup` サブコマンド
+
+```bash
+python3 sakura_backup.py backup \
+    --source /path/to/target/dir \
+    --name my-backup \
+    --password 'YOUR_PASSWORD' \
+    [--delete-source] \
+    [--quiet]
+```
+
+| オプション | 必須 | 説明 |
+|---|---|---|
+| `--source PATH` | ✓ | バックアップ対象ディレクトリ（絶対パス推奨） |
+| `--name NAME` | ✓ | リモートファイル名。`.tar.gz.enc` 自動付与。同名ファイルは常に上書き |
+| `--password PASS` | ✓ | 暗号化パスワード（`ps aux` で可視化される点に注意） |
+| `--delete-source` | ー | 成功時にローカルを削除（既定OFF） |
+| `--quiet` | ー | 進捗バーを抑制（cronログ向け） |
+
+### ファイル名の制約
+
+`--name` は `[a-zA-Z0-9-_.]` のみ許可（シェルインジェクション対策）。`/`, `..`, スペース, シェルメタ文字は拒否。
+
+### 終了コード
+
+| コード | 意味 |
+|---|---|
+| 0 | 成功 |
+| 1 | 引数エラー（必須欠如、ファイル名不正、ソース未存在） |
+| 2 | 環境/依存エラー（`.env` 不備、`sshpass` 不在、リモート接続失敗） |
+| 3 | バックアップ失敗（tar/openssl/ssh 失敗、検証不一致） |
+
+### 対話モードとの関係
+
+- **CLIモードでバックアップ** → `archives.yaml` に同名エントリとして登録（既存あれば更新、なければ追加）
+- **対話モードでリストア** → CLIでバックアップしたファイルもそのまま ID 指定で復元可能
+- リストア機能はCLI化されていません（対話モード `[2] Restore` から実行）
+
+## systemd timer での自動運用
+
+### 構成例（週次バックアップ）
+
+ラッパースクリプト `cron-backup.sh` が同梱されており、バックアップ実行と Slack 通知（成功・失敗両方）をまとめて行います。
+
+**`/etc/systemd/system/sakura-backup-example.service`**
+
+```ini
+[Unit]
+Description=Sakura backup: example
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=your-user
+Group=your-user
+WorkingDirectory=/path/to/sakura-backup
+Environment=HOME=/home/your-user
+ExecStart=/path/to/sakura-backup/cron-backup.sh /path/to/target my-backup-name 'YOUR_PASSWORD'
+```
+
+**`/etc/systemd/system/sakura-backup-example.timer`**
+
+```ini
+[Unit]
+Description=Sakura backup example - weekly Thu 00:00
+
+[Timer]
+OnCalendar=Thu *-*-* 00:00:00
+Persistent=false
+Unit=sakura-backup-example.service
+
+[Install]
+WantedBy=timers.target
+```
+
+### 登録と確認
+
+```bash
+# タイマー有効化
+sudo systemctl daemon-reload
+sudo systemctl enable --now sakura-backup-example.timer
+
+# 次回実行時刻を確認
+systemctl list-timers sakura-backup-example.timer
+
+# 手動で即時実行
+sudo systemctl start sakura-backup-example.service
+
+# ログ確認
+journalctl -u sakura-backup-example.service -n 100
+```
+
+### cron-backup.sh の役割
+
+```
+cron-backup.sh <source> <name> <password>
+  ↓
+sakura_backup.py backup --source ... --name ... --password ... --quiet
+  ↓
+結果を整形して Slack に通知（成功・失敗どちらも）
+  ↓
+バックアップの exit code をそのまま返却
+```
+
+Slack 通知には `send_slack.py`（別途 `~/.claude/skills/slack-notify/`）を使用。環境に合わせてパスを調整してください。
+
+### 大容量ファイル対応
+
+SHA1検証（リモート側 `php sha1_file()` 実行）は、10GB級の暗号化ファイルでも完走するよう最大1時間のタイムアウトに設定されています。
+
 ## アーカイブ形式
 
-- `tar czf` (gzip圧縮、全メタデータ保持) + `openssl enc -aes-256-cbc -pbkdf2` (AES-256暗号化)
-- ファイル名: `<SHA1ハッシュ>.tar.gz.enc`
+- `tar --format=posix -czf` (gzip圧縮、PAXフォーマットでナノ秒精度のタイムスタンプ含む全メタデータ保持) + `openssl enc -aes-256-cbc -pbkdf2` (AES-256暗号化)
+- ファイル名:
+  - **対話モード**: `<SHA1ハッシュ>.tar.gz.enc`（内容ベースで自動ユニーク化）
+  - **CLIモード**: `<--nameで指定>.tar.gz.enc`（固定名、同名は上書き）
 - バックアップ台帳: `archives.yaml`
 
 ## パイプライン

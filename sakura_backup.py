@@ -5,6 +5,7 @@ Sakura Backup Manager
 暗号化ストリーミングバックアップするCLIツール
 """
 
+import argparse
 import subprocess
 import sys
 import os
@@ -30,6 +31,13 @@ ARCHIVES_PATH = SCRIPT_DIR / "archives.yaml"
 # Constants
 CHUNK_SIZE = 65536
 JST = timezone(timedelta(hours=9))
+
+# Module-wide flags
+_QUIET = False
+
+# Allowed characters for --name (alphanumerics, -, _, .)
+_NAME_ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+_REMOTE_EXT = ".tar.gz.enc"
 
 
 # ─────────────────────────────────────────────
@@ -102,8 +110,8 @@ def next_id(archives):
 # SSH operations
 # ─────────────────────────────────────────────
 
-def ssh_command(config, cmd):
-    """Execute remote SSH command."""
+def ssh_command(config, cmd, timeout=60):
+    """Execute remote SSH command. timeout in seconds."""
     full_cmd = [
         "sshpass", "-p", config["SAKURA_PASSWORD"],
         "ssh", "-o", "StrictHostKeyChecking=no",
@@ -111,7 +119,7 @@ def ssh_command(config, cmd):
         f"{config['SAKURA_USER']}@{config['SAKURA_HOST']}",
         cmd
     ]
-    result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=60)
+    result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
     return result.stdout, result.stderr, result.returncode
 
 
@@ -125,9 +133,10 @@ def ensure_remote_dir(config):
 
 
 def ssh_remote_sha1(config, remote_path):
-    """Get SHA1 hash of remote file using PHP."""
+    """Get SHA1 hash of remote file using PHP. Long timeout for large files."""
     cmd = f"""php -r 'echo sha1_file("{remote_path}");'"""
-    stdout, stderr, rc = ssh_command(config, cmd)
+    # SHA1 of a multi-GB file on shared hosting can take many minutes
+    stdout, stderr, rc = ssh_command(config, cmd, timeout=3600)
     if rc != 0:
         return None
     return stdout.strip()
@@ -135,7 +144,7 @@ def ssh_remote_sha1(config, remote_path):
 
 def ssh_remote_size(config, remote_path):
     """Get remote file size in bytes."""
-    stdout, _, rc = ssh_command(config, f"wc -c < '{remote_path}'")
+    stdout, _, rc = ssh_command(config, f"wc -c < '{remote_path}'", timeout=300)
     if rc != 0:
         return None
     try:
@@ -202,6 +211,8 @@ def print_header():
 
 def print_progress(current, total, prefix="進捗"):
     """Print progress bar."""
+    if _QUIET:
+        return
     if total == 0:
         return
     pct = min(current / total * 100, 100)
@@ -216,6 +227,34 @@ def print_progress(current, total, prefix="進捗"):
 # ─────────────────────────────────────────────
 # Backup
 # ─────────────────────────────────────────────
+
+def sanitize_name(name):
+    """
+    Validate user-supplied --name for use as a remote filename.
+    Returns the validated bare name (no extension manipulation).
+    Raises ValueError on rejection.
+    """
+    if not name:
+        raise ValueError("--name が空です。")
+    if name in (".", ".."):
+        raise ValueError("--name に '.' または '..' は使用できません。")
+    if ".." in name:
+        raise ValueError("--name に '..' を含めることはできません。")
+    for ch in name:
+        if ch not in _NAME_ALLOWED:
+            raise ValueError(
+                f"--name に使用できない文字が含まれています: {ch!r} "
+                f"(英数字, '-', '_', '.' のみ許可)"
+            )
+    return name
+
+
+def normalize_remote_name(name):
+    """Append .tar.gz.enc if not already present (idempotent)."""
+    if name.endswith(_REMOTE_EXT):
+        return name
+    return name + _REMOTE_EXT
+
 
 def stream_backup(config, source_path, password):
     """
@@ -333,8 +372,15 @@ def stream_backup(config, source_path, password):
     return sha1.hexdigest(), encrypted_size, temp_name
 
 
-def backup_single(config, source, password):
-    """Backup a single directory. Returns entry dict on success, None on failure."""
+def backup_single(config, source, password, custom_name=None):
+    """
+    Backup a single directory. Returns entry dict on success, None on failure.
+
+    custom_name: if provided, use this as the remote filename (already normalized
+                 and sanitized by caller). When set, an existing archives.yaml entry
+                 for the same remote filename is updated in-place (1 file = 1 entry).
+                 If None, the SHA1-based hash naming is used (legacy interactive flow).
+    """
     source = os.path.realpath(source)
     dir_size = get_dir_size(source)
     file_count = get_file_count(source)
@@ -351,14 +397,19 @@ def backup_single(config, source, password):
         print(f"\n  Error: {e}")
         return None
 
-    # Rename to hash-based name
+    # Decide final remote name
     temp_remote = f"{config['SAKURA_BACKUP_DIR']}/{temp_name}"
-    final_name = f"{sha1_hex}.tar.gz.enc"
+    if custom_name is not None:
+        final_name = custom_name
+    else:
+        final_name = f"{sha1_hex}.tar.gz.enc"
     final_remote = f"{config['SAKURA_BACKUP_DIR']}/{final_name}"
 
-    _, _, rc = ssh_command(config, f"mv '{temp_remote}' '{final_remote}'")
+    # Rename (force overwrite for collision safety in CLI custom-name flow)
+    _, _, rc = ssh_command(config, f"mv -f '{temp_remote}' '{final_remote}'")
     if rc != 0:
         print(f"  Error: リモートファイルのリネームに失敗しました。")
+        ssh_remote_delete(config, temp_remote)
         return None
 
     # Verify remote
@@ -378,18 +429,42 @@ def backup_single(config, source, password):
 
     # Update archives
     archives = load_archives()
-    entry = {
-        "id": next_id(archives),
-        "source_path": source,
-        "remote_filename": final_name,
-        "sha1": sha1_hex,
-        "size_bytes": enc_size,
-        "original_size_bytes": dir_size,
-        "file_count": file_count,
-        "datetime": datetime.now(JST).isoformat(),
-        "local_deleted": False,
-    }
-    archives["backups"].append(entry)
+    now_iso = datetime.now(JST).isoformat()
+
+    existing = None
+    if custom_name is not None:
+        existing = next(
+            (b for b in archives["backups"] if b.get("remote_filename") == final_name),
+            None,
+        )
+
+    if existing is not None:
+        # Update in place (preserve id)
+        existing.update({
+            "source_path": source,
+            "remote_filename": final_name,
+            "sha1": sha1_hex,
+            "size_bytes": enc_size,
+            "original_size_bytes": dir_size,
+            "file_count": file_count,
+            "datetime": now_iso,
+            "local_deleted": False,
+        })
+        entry = existing
+    else:
+        entry = {
+            "id": next_id(archives),
+            "source_path": source,
+            "remote_filename": final_name,
+            "sha1": sha1_hex,
+            "size_bytes": enc_size,
+            "original_size_bytes": dir_size,
+            "file_count": file_count,
+            "datetime": now_iso,
+            "local_deleted": False,
+        }
+        archives["backups"].append(entry)
+
     save_archives(archives)
 
     return entry
@@ -808,7 +883,7 @@ def do_verify(config):
 # Main
 # ─────────────────────────────────────────────
 
-def main():
+def main_interactive():
     check_dependencies()
     config = load_env()
 
@@ -832,6 +907,111 @@ def main():
 
         print()
         input("  [Enter] でメニューに戻る...")
+
+
+# ─────────────────────────────────────────────
+# CLI mode
+# ─────────────────────────────────────────────
+
+def cli_backup(args):
+    """
+    Non-interactive backup entry point.
+    Returns exit code:
+        0 = success
+        1 = argument error
+        2 = environment / dependency error
+        3 = backup / verification failure
+    """
+    global _QUIET
+    _QUIET = bool(args.quiet)
+
+    # 1. Validate source
+    source = os.path.expanduser(args.source)
+    if not os.path.isdir(source):
+        print(f"Error: --source ディレクトリが存在しません: {source}", file=sys.stderr)
+        return 1
+    source = os.path.realpath(source)
+
+    # 2. Validate / normalize name
+    try:
+        bare = sanitize_name(args.name)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    final_name = normalize_remote_name(bare)
+
+    # 3. Password
+    password = args.password
+    if not password:
+        print("Error: --password が空です。", file=sys.stderr)
+        return 1
+
+    # 4. Dependencies / config
+    try:
+        check_dependencies()
+    except SystemExit:
+        return 2
+
+    try:
+        config = load_env()
+    except SystemExit:
+        return 2
+
+    # 5. Ensure remote dir
+    if not ensure_remote_dir(config):
+        return 2
+
+    # 6. Run backup
+    print(f"=== CLI Backup ===")
+    print(f"  source: {source}")
+    print(f"  remote: {final_name}")
+
+    entry = backup_single(config, source, password, custom_name=final_name)
+    if entry is None:
+        print("Error: バックアップに失敗しました。", file=sys.stderr)
+        return 3
+
+    # 7. Optional source deletion
+    if args.delete_source:
+        _delete_source(entry)
+
+    print(f"\n  完了: id={entry['id']} remote={entry['remote_filename']}")
+    return 0
+
+
+def cli_main():
+    """argparse-based CLI dispatcher."""
+    parser = argparse.ArgumentParser(
+        prog="sakura_backup.py",
+        description="Sakura Backup Manager (CLI mode). 引数なしで起動すると対話モード。",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_backup = sub.add_parser(
+        "backup",
+        help="Non-interactive backup. ローカルディレクトリをさくらに転送。",
+    )
+    p_backup.add_argument("--source", required=True, help="バックアップ対象ディレクトリ")
+    p_backup.add_argument("--name", required=True, help="リモートファイル名 (.tar.gz.enc は自動付与)")
+    p_backup.add_argument("--password", required=True, help="暗号化パスワード")
+    p_backup.add_argument("--delete-source", action="store_true", help="成功時にローカルを削除")
+    p_backup.add_argument("--quiet", action="store_true", help="進捗バーを抑制")
+
+    args = parser.parse_args()
+
+    if args.command == "backup":
+        sys.exit(cli_backup(args))
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+def main():
+    """Dispatch: no args = interactive menu, args = CLI mode."""
+    if len(sys.argv) > 1:
+        cli_main()
+    else:
+        main_interactive()
 
 
 if __name__ == "__main__":
